@@ -75,6 +75,8 @@ type processOptions struct {
 	SessionKey              string              // Session identifier for history/context
 	Channel                 string              // Target channel for tool execution
 	ChatID                  string              // Target chat ID for tool execution
+	MessageID               string              // Current inbound platform message ID
+	ReplyToMessageID        string              // Current inbound reply target message ID
 	SenderID                string              // Current sender ID for dynamic context
 	SenderDisplayName       string              // Current sender display name for dynamic context
 	UserMessage             string              // User message content (may include prefix)
@@ -85,6 +87,7 @@ type processOptions struct {
 	DefaultResponse         string              // Response when LLM returns empty
 	EnableSummary           bool                // Whether to trigger summarization
 	SendResponse            bool                // Whether to send response via bus
+	SuppressToolFeedback    bool                // Whether to suppress inline tool feedback messages
 	NoHistory               bool                // If true, don't load session history (for heartbeat)
 	SkipInitialSteeringPoll bool                // If true, skip the steering poll at loop start (used by Continue)
 }
@@ -96,14 +99,16 @@ type continuationTarget struct {
 }
 
 const (
-	defaultResponse           = "The model returned an empty response. This may indicate a provider error or token limit."
-	toolLimitResponse         = "I've reached `max_tool_iterations` without a final response. Increase `max_tool_iterations` in config.json if this task needs more tool steps."
-	sessionKeyAgentPrefix     = "agent:"
-	metadataKeyAccountID      = "account_id"
-	metadataKeyGuildID        = "guild_id"
-	metadataKeyTeamID         = "team_id"
-	metadataKeyParentPeerKind = "parent_peer_kind"
-	metadataKeyParentPeerID   = "parent_peer_id"
+	defaultResponse            = "The model returned an empty response. This may indicate a provider error or token limit."
+	toolLimitResponse          = "I've reached `max_tool_iterations` without a final response. Increase `max_tool_iterations` in config.json if this task needs more tool steps."
+	handledToolResponseSummary = "Requested output delivered via tool attachment."
+	sessionKeyAgentPrefix      = "agent:"
+	metadataKeyAccountID       = "account_id"
+	metadataKeyGuildID         = "guild_id"
+	metadataKeyTeamID          = "team_id"
+	metadataKeyReplyToMessage  = "reply_to_message_id"
+	metadataKeyParentPeerKind  = "parent_peer_kind"
+	metadataKeyParentPeerID    = "parent_peer_id"
 )
 
 func NewAgentLoop(
@@ -163,33 +168,27 @@ func registerSharedTools(
 
 		if cfg.Tools.IsToolEnabled("web") {
 			searchTool, err := tools.NewWebSearchTool(tools.WebSearchToolOptions{
-				BraveAPIKeys:    config.MergeAPIKeys(cfg.Tools.Web.Brave.APIKey(), cfg.Tools.Web.Brave.APIKeys()),
-				BraveMaxResults: cfg.Tools.Web.Brave.MaxResults,
-				BraveEnabled:    cfg.Tools.Web.Brave.Enabled,
-				TavilyAPIKeys: config.MergeAPIKeys(
-					cfg.Tools.Web.Tavily.APIKey(),
-					cfg.Tools.Web.Tavily.APIKeys(),
-				),
-				TavilyBaseURL:        cfg.Tools.Web.Tavily.BaseURL,
-				TavilyMaxResults:     cfg.Tools.Web.Tavily.MaxResults,
-				TavilyEnabled:        cfg.Tools.Web.Tavily.Enabled,
-				DuckDuckGoMaxResults: cfg.Tools.Web.DuckDuckGo.MaxResults,
-				DuckDuckGoEnabled:    cfg.Tools.Web.DuckDuckGo.Enabled,
-				PerplexityAPIKeys: config.MergeAPIKeys(
-					cfg.Tools.Web.Perplexity.APIKey(),
-					cfg.Tools.Web.Perplexity.APIKeys(),
-				),
+				BraveAPIKeys:          cfg.Tools.Web.Brave.APIKeys.Values(),
+				BraveMaxResults:       cfg.Tools.Web.Brave.MaxResults,
+				BraveEnabled:          cfg.Tools.Web.Brave.Enabled,
+				TavilyAPIKeys:         cfg.Tools.Web.Tavily.APIKeys.Values(),
+				TavilyBaseURL:         cfg.Tools.Web.Tavily.BaseURL,
+				TavilyMaxResults:      cfg.Tools.Web.Tavily.MaxResults,
+				TavilyEnabled:         cfg.Tools.Web.Tavily.Enabled,
+				DuckDuckGoMaxResults:  cfg.Tools.Web.DuckDuckGo.MaxResults,
+				DuckDuckGoEnabled:     cfg.Tools.Web.DuckDuckGo.Enabled,
+				PerplexityAPIKeys:     cfg.Tools.Web.Perplexity.APIKeys.Values(),
 				PerplexityMaxResults:  cfg.Tools.Web.Perplexity.MaxResults,
 				PerplexityEnabled:     cfg.Tools.Web.Perplexity.Enabled,
 				SearXNGBaseURL:        cfg.Tools.Web.SearXNG.BaseURL,
 				SearXNGMaxResults:     cfg.Tools.Web.SearXNG.MaxResults,
 				SearXNGEnabled:        cfg.Tools.Web.SearXNG.Enabled,
-				GLMSearchAPIKey:       cfg.Tools.Web.GLMSearch.APIKey(),
+				GLMSearchAPIKey:       cfg.Tools.Web.GLMSearch.APIKey.String(),
 				GLMSearchBaseURL:      cfg.Tools.Web.GLMSearch.BaseURL,
 				GLMSearchEngine:       cfg.Tools.Web.GLMSearch.SearchEngine,
 				GLMSearchMaxResults:   cfg.Tools.Web.GLMSearch.MaxResults,
 				GLMSearchEnabled:      cfg.Tools.Web.GLMSearch.Enabled,
-				BaiduSearchAPIKey:     cfg.Tools.Web.BaiduSearch.APIKey(),
+				BaiduSearchAPIKey:     cfg.Tools.Web.BaiduSearch.APIKey.String(),
 				BaiduSearchBaseURL:    cfg.Tools.Web.BaiduSearch.BaseURL,
 				BaiduSearchMaxResults: cfg.Tools.Web.BaiduSearch.MaxResults,
 				BaiduSearchEnabled:    cfg.Tools.Web.BaiduSearch.Enabled,
@@ -226,16 +225,36 @@ func registerSharedTools(
 		// Message tool
 		if cfg.Tools.IsToolEnabled("message") {
 			messageTool := tools.NewMessageTool()
-			messageTool.SetSendCallback(func(channel, chatID, content string) error {
+			messageTool.SetSendCallback(func(channel, chatID, content, replyToMessageID string) error {
 				pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer pubCancel()
 				return msgBus.PublishOutbound(pubCtx, bus.OutboundMessage{
-					Channel: channel,
-					ChatID:  chatID,
-					Content: content,
+					Channel:          channel,
+					ChatID:           chatID,
+					Content:          content,
+					ReplyToMessageID: replyToMessageID,
 				})
 			})
 			agent.Tools.Register(messageTool)
+		}
+		if cfg.Tools.IsToolEnabled("reaction") {
+			reactionTool := tools.NewReactionTool()
+			reactionTool.SetReactionCallback(func(ctx context.Context, channel, chatID, messageID string) error {
+				if al.channelManager == nil {
+					return fmt.Errorf("channel manager not configured")
+				}
+				ch, ok := al.channelManager.GetChannel(channel)
+				if !ok {
+					return fmt.Errorf("channel %s not found", channel)
+				}
+				rc, ok := ch.(channels.ReactionCapable)
+				if !ok {
+					return fmt.Errorf("channel %s does not support reactions", channel)
+				}
+				_, err := rc.ReactToMessage(ctx, chatID, messageID)
+				return err
+			})
+			agent.Tools.Register(reactionTool)
 		}
 
 		// Send file tool (outbound media via MediaStore — store injected later by SetMediaStore)
@@ -261,7 +280,7 @@ func registerSharedTools(
 				ClawHub: skills.ClawHubConfig{
 					Enabled:         clawHubConfig.Enabled,
 					BaseURL:         clawHubConfig.BaseURL,
-					AuthToken:       clawHubConfig.AuthToken(),
+					AuthToken:       clawHubConfig.AuthToken.String(),
 					SearchPath:      clawHubConfig.SearchPath,
 					SkillsPath:      clawHubConfig.SkillsPath,
 					DownloadPath:    clawHubConfig.DownloadPath,
@@ -391,10 +410,17 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 		return err
 	}
 
-	for al.running.Load() {
+	idleTicker := time.NewTicker(100 * time.Millisecond)
+	defer idleTicker.Stop()
+
+	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-idleTicker.C:
+			if !al.running.Load() {
+				return nil
+			}
 		case msg, ok := <-al.bus.InboundChan():
 			if !ok {
 				return nil
@@ -458,7 +484,7 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 				if target == nil {
 					cancelDrain()
 					if finalResponse != "" {
-						al.publishResponseIfNeeded(ctx, msg.Channel, msg.ChatID, finalResponse)
+						al.PublishResponseIfNeeded(ctx, msg.Channel, msg.ChatID, finalResponse)
 					}
 					return
 				}
@@ -518,15 +544,11 @@ func (al *AgentLoop) Run(ctx context.Context) error {
 				}
 
 				if finalResponse != "" {
-					al.publishResponseIfNeeded(ctx, target.Channel, target.ChatID, finalResponse)
+					al.PublishResponseIfNeeded(ctx, target.Channel, target.ChatID, finalResponse)
 				}
 			}()
-		default:
-			time.Sleep(time.Microsecond * 200)
 		}
 	}
-
-	return nil
 }
 
 // drainBusToSteering consumes inbound messages and redirects messages from the
@@ -604,7 +626,7 @@ func (al *AgentLoop) Stop() {
 	al.running.Store(false)
 }
 
-func (al *AgentLoop) publishResponseIfNeeded(ctx context.Context, channel, chatID, response string) {
+func (al *AgentLoop) PublishResponseIfNeeded(ctx context.Context, channel, chatID, response string) {
 	if response == "" {
 		return
 	}
@@ -1030,13 +1052,13 @@ func (al *AgentLoop) GetConfig() *config.Config {
 func (al *AgentLoop) SetMediaStore(s media.MediaStore) {
 	al.mediaStore = s
 
-	// Propagate store to send_file tools in all agents.
+	// Propagate store to all registered tools that can emit media.
 	registry := al.GetRegistry()
-	registry.ForEachTool("send_file", func(t tools.Tool) {
-		if sf, ok := t.(*tools.SendFileTool); ok {
-			sf.SetMediaStore(s)
+	for _, agentID := range registry.ListAgentIDs() {
+		if agent, ok := registry.GetAgent(agentID); ok {
+			agent.Tools.SetMediaStore(s)
 		}
-	})
+	}
 }
 
 // SetTranscriber injects a voice transcriber for agent-level audio transcription.
@@ -1241,14 +1263,15 @@ func (al *AgentLoop) ProcessHeartbeat(
 		return "", fmt.Errorf("no default agent for heartbeat")
 	}
 	return al.runAgentLoop(ctx, agent, processOptions{
-		SessionKey:      "heartbeat",
-		Channel:         channel,
-		ChatID:          chatID,
-		UserMessage:     content,
-		DefaultResponse: defaultResponse,
-		EnableSummary:   false,
-		SendResponse:    false,
-		NoHistory:       true, // Don't load session history for heartbeat
+		SessionKey:           "heartbeat",
+		Channel:              channel,
+		ChatID:               chatID,
+		UserMessage:          content,
+		DefaultResponse:      defaultResponse,
+		EnableSummary:        false,
+		SendResponse:         false,
+		SuppressToolFeedback: true,
+		NoHistory:            true, // Don't load session history for heartbeat
 	})
 }
 
@@ -1315,6 +1338,8 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 		SessionKey:        sessionKey,
 		Channel:           msg.Channel,
 		ChatID:            msg.ChatID,
+		MessageID:         msg.MessageID,
+		ReplyToMessageID:  inboundMetadata(msg, metadataKeyReplyToMessage),
 		SenderID:          msg.SenderID,
 		SenderDisplayName: msg.Sender.DisplayName,
 		UserMessage:       msg.Content,
@@ -1683,7 +1708,11 @@ func (al *AgentLoop) runTurn(ctx context.Context, ts *turnState) (turnResult, er
 		ts.recordPersistedMessage(rootMsg)
 	}
 
-	activeCandidates, activeModel := al.selectCandidates(ts.agent, ts.userMessage, messages)
+	activeCandidates, activeModel, usedLight := al.selectCandidates(ts.agent, ts.userMessage, messages)
+	activeProvider := ts.agent.Provider
+	if usedLight && ts.agent.LightProvider != nil {
+		activeProvider = ts.agent.LightProvider
+	}
 	pendingMessages := append([]providers.Message(nil), ts.opts.InitialSteeringMessages...)
 	var finalContent string
 
@@ -1905,7 +1934,7 @@ turnLoop:
 					providerCtx,
 					activeCandidates,
 					func(ctx context.Context, provider, model string) (*providers.LLMResponse, error) {
-						return ts.agent.Provider.Chat(ctx, messagesForCall, toolDefsForCall, model, llmOpts)
+						return activeProvider.Chat(ctx, messagesForCall, toolDefsForCall, model, llmOpts)
 					},
 				)
 				if fbErr != nil {
@@ -1921,7 +1950,7 @@ turnLoop:
 				}
 				return fbResult.Response, nil
 			}
-			return ts.agent.Provider.Chat(providerCtx, messagesForCall, toolDefsForCall, llmModel, llmOpts)
+			return activeProvider.Chat(providerCtx, messagesForCall, toolDefsForCall, llmModel, llmOpts)
 		}
 
 		var response *providers.LLMResponse
@@ -1946,6 +1975,7 @@ turnLoop:
 
 			isContextError := !isTimeoutError && (strings.Contains(errMsg, "context_length_exceeded") ||
 				strings.Contains(errMsg, "context window") ||
+				strings.Contains(errMsg, "context_window") ||
 				strings.Contains(errMsg, "maximum context length") ||
 				strings.Contains(errMsg, "token limit") ||
 				strings.Contains(errMsg, "too many tokens") ||
@@ -2112,16 +2142,21 @@ turnLoop:
 			},
 		)
 
-		logger.DebugCF("agent", "LLM response",
-			map[string]any{
-				"agent_id":       ts.agent.ID,
-				"iteration":      iteration,
-				"content_chars":  len(response.Content),
-				"tool_calls":     len(response.ToolCalls),
-				"reasoning":      response.Reasoning,
-				"target_channel": al.targetReasoningChannelID(ts.channel),
-				"channel":        ts.channel,
-			})
+		llmResponseFields := map[string]any{
+			"agent_id":       ts.agent.ID,
+			"iteration":      iteration,
+			"content_chars":  len(response.Content),
+			"tool_calls":     len(response.ToolCalls),
+			"reasoning":      response.Reasoning,
+			"target_channel": al.targetReasoningChannelID(ts.channel),
+			"channel":        ts.channel,
+		}
+		if response.Usage != nil {
+			llmResponseFields["prompt_tokens"] = response.Usage.PromptTokens
+			llmResponseFields["completion_tokens"] = response.Usage.CompletionTokens
+			llmResponseFields["total_tokens"] = response.Usage.TotalTokens
+		}
+		logger.DebugCF("agent", "LLM response", llmResponseFields)
 
 		if len(response.ToolCalls) == 0 || gracefulTerminal {
 			responseContent := response.Content
@@ -2165,6 +2200,7 @@ turnLoop:
 				"iteration": iteration,
 			})
 
+		allResponsesHandled := len(normalizedToolCalls) > 0
 		assistantMsg := providers.Message{
 			Role:             "assistant",
 			Content:          response.Content,
@@ -2221,6 +2257,7 @@ turnLoop:
 						toolArgs = toolReq.Arguments
 					}
 				case HookActionDenyTool:
+					allResponsesHandled = false
 					denyContent := hookDeniedToolContent("Tool execution denied by hook", decision.Reason)
 					al.emitEvent(
 						EventKindToolExecSkipped,
@@ -2260,6 +2297,7 @@ turnLoop:
 					ChatID:    ts.chatID,
 				})
 				if !approval.Approved {
+					allResponsesHandled = false
 					denyContent := hookDeniedToolContent("Tool execution denied by approval hook", approval.Reason)
 					al.emitEvent(
 						EventKindToolExecSkipped,
@@ -2301,7 +2339,9 @@ turnLoop:
 			)
 
 			// Send tool feedback to chat channel if enabled (from HEAD)
-			if al.cfg.Agents.Defaults.IsToolFeedbackEnabled() && ts.channel != "" {
+			if al.cfg.Agents.Defaults.IsToolFeedbackEnabled() &&
+				ts.channel != "" &&
+				!ts.opts.SuppressToolFeedback {
 				feedbackPreview := utils.Truncate(
 					string(argsJSON),
 					al.cfg.Agents.Defaults.GetToolFeedbackMaxArgsLength(),
@@ -2333,10 +2373,7 @@ turnLoop:
 				}
 
 				// Determine content for the agent loop (ForLLM or error).
-				content := result.ForLLM
-				if content == "" && result.Err != nil {
-					content = result.Err.Error()
-				}
+				content := result.ContentForLLM()
 				if content == "" {
 					return
 				}
@@ -2372,8 +2409,15 @@ turnLoop:
 			}
 
 			toolStart := time.Now()
-			toolResult := ts.agent.Tools.ExecuteWithContext(
+			execCtx := tools.WithToolInboundContext(
 				turnCtx,
+				ts.channel,
+				ts.chatID,
+				ts.opts.MessageID,
+				ts.opts.ReplyToMessageID,
+			)
+			toolResult := ts.agent.Tools.ExecuteWithContext(
+				execCtx,
 				toolName,
 				toolArgs,
 				ts.channel,
@@ -2420,6 +2464,50 @@ turnLoop:
 			if toolResult == nil {
 				toolResult = tools.ErrorResult("hook returned nil tool result")
 			}
+			if len(toolResult.Media) > 0 && toolResult.ResponseHandled {
+				parts := make([]bus.MediaPart, 0, len(toolResult.Media))
+				for _, ref := range toolResult.Media {
+					part := bus.MediaPart{Ref: ref}
+					if al.mediaStore != nil {
+						if _, meta, err := al.mediaStore.ResolveWithMeta(ref); err == nil {
+							part.Filename = meta.Filename
+							part.ContentType = meta.ContentType
+							part.Type = inferMediaType(meta.Filename, meta.ContentType)
+						}
+					}
+					parts = append(parts, part)
+				}
+				outboundMedia := bus.OutboundMediaMessage{
+					Channel: ts.channel,
+					ChatID:  ts.chatID,
+					Parts:   parts,
+				}
+				if al.channelManager != nil && ts.channel != "" && !constants.IsInternalChannel(ts.channel) {
+					if err := al.channelManager.SendMedia(ctx, outboundMedia); err != nil {
+						logger.WarnCF("agent", "Failed to deliver handled tool media",
+							map[string]any{
+								"agent_id": ts.agent.ID,
+								"tool":     toolName,
+								"channel":  ts.channel,
+								"chat_id":  ts.chatID,
+								"error":    err.Error(),
+							})
+						toolResult = tools.ErrorResult(fmt.Sprintf("failed to deliver attachment: %v", err)).WithError(err)
+					}
+				} else if al.bus != nil {
+					al.bus.PublishOutboundMedia(ctx, outboundMedia)
+					// Queuing media is only best-effort; it has not been delivered yet.
+					toolResult.ResponseHandled = false
+				}
+			}
+
+			if len(toolResult.Media) > 0 && !toolResult.ResponseHandled {
+				toolResult.ArtifactTags = buildArtifactTags(al.mediaStore, toolResult.Media)
+			}
+
+			if !toolResult.ResponseHandled {
+				allResponsesHandled = false
+			}
 
 			if !toolResult.Silent && toolResult.ForUser != "" && ts.opts.SendResponse {
 				al.bus.PublishOutbound(ctx, bus.OutboundMessage{
@@ -2434,30 +2522,7 @@ turnLoop:
 					})
 			}
 
-			if len(toolResult.Media) > 0 {
-				parts := make([]bus.MediaPart, 0, len(toolResult.Media))
-				for _, ref := range toolResult.Media {
-					part := bus.MediaPart{Ref: ref}
-					if al.mediaStore != nil {
-						if _, meta, err := al.mediaStore.ResolveWithMeta(ref); err == nil {
-							part.Filename = meta.Filename
-							part.ContentType = meta.ContentType
-							part.Type = inferMediaType(meta.Filename, meta.ContentType)
-						}
-					}
-					parts = append(parts, part)
-				}
-				al.bus.PublishOutboundMedia(ctx, bus.OutboundMediaMessage{
-					Channel: ts.channel,
-					ChatID:  ts.chatID,
-					Parts:   parts,
-				})
-			}
-
-			contentForLLM := toolResult.ForLLM
-			if contentForLLM == "" && toolResult.Err != nil {
-				contentForLLM = toolResult.Err.Error()
-			}
+			contentForLLM := toolResult.ContentForLLM()
 
 			// Filter sensitive data (API keys, tokens, secrets) before sending to LLM
 			if al.cfg.Tools.IsFilterSensitiveDataEnabled() {
@@ -2550,6 +2615,70 @@ turnLoop:
 					// No results available
 				}
 			}
+		}
+
+		if allResponsesHandled {
+			if len(pendingMessages) > 0 {
+				logger.InfoCF("agent", "Pending steering exists after handled tool delivery; continuing turn before finalizing",
+					map[string]any{
+						"agent_id":       ts.agent.ID,
+						"steering_count": len(pendingMessages),
+						"session_key":    ts.sessionKey,
+					})
+				finalContent = ""
+				goto turnLoop
+			}
+
+			if steerMsgs := al.dequeueSteeringMessagesForScope(ts.sessionKey); len(steerMsgs) > 0 {
+				logger.InfoCF("agent", "Steering arrived after handled tool delivery; continuing turn before finalizing",
+					map[string]any{
+						"agent_id":       ts.agent.ID,
+						"steering_count": len(steerMsgs),
+						"session_key":    ts.sessionKey,
+					})
+				pendingMessages = append(pendingMessages, steerMsgs...)
+				finalContent = ""
+				goto turnLoop
+			}
+
+			summaryMsg := providers.Message{
+				Role:    "assistant",
+				Content: handledToolResponseSummary,
+			}
+
+			if !ts.opts.NoHistory {
+				ts.agent.Sessions.AddMessage(ts.sessionKey, summaryMsg.Role, summaryMsg.Content)
+				ts.recordPersistedMessage(summaryMsg)
+				if err := ts.agent.Sessions.Save(ts.sessionKey); err != nil {
+					turnStatus = TurnEndStatusError
+					al.emitEvent(
+						EventKindError,
+						ts.eventMeta("runTurn", "turn.error"),
+						ErrorPayload{
+							Stage:   "session_save",
+							Message: err.Error(),
+						},
+					)
+					return turnResult{}, err
+				}
+			}
+			if ts.opts.EnableSummary {
+				al.maybeSummarize(ts.agent, ts.sessionKey, ts.scope)
+			}
+
+			ts.setPhase(TurnPhaseCompleted)
+			ts.setFinalContent("")
+			logger.InfoCF("agent", "Tool output satisfied delivery; ending turn without follow-up LLM",
+				map[string]any{
+					"agent_id":   ts.agent.ID,
+					"iteration":  iteration,
+					"tool_count": len(normalizedToolCalls),
+				})
+			return turnResult{
+				finalContent: "",
+				status:       turnStatus,
+				followUps:    append([]bus.InboundMessage(nil), ts.followUps...),
+			}, nil
 		}
 
 		ts.agent.Tools.TickTTL()
@@ -2657,9 +2786,9 @@ func (al *AgentLoop) selectCandidates(
 	agent *AgentInstance,
 	userMsg string,
 	history []providers.Message,
-) (candidates []providers.FallbackCandidate, model string) {
+) (candidates []providers.FallbackCandidate, model string, usedLight bool) {
 	if agent.Router == nil || len(agent.LightCandidates) == 0 {
-		return agent.Candidates, resolvedCandidateModel(agent.Candidates, agent.Model)
+		return agent.Candidates, resolvedCandidateModel(agent.Candidates, agent.Model), false
 	}
 
 	_, usedLight, score := agent.Router.SelectModel(userMsg, history, agent.Model)
@@ -2670,7 +2799,7 @@ func (al *AgentLoop) selectCandidates(
 				"score":     score,
 				"threshold": agent.Router.Threshold(),
 			})
-		return agent.Candidates, resolvedCandidateModel(agent.Candidates, agent.Model)
+		return agent.Candidates, resolvedCandidateModel(agent.Candidates, agent.Model), false
 	}
 
 	logger.InfoCF("agent", "Model routing: light model selected",
@@ -2680,7 +2809,7 @@ func (al *AgentLoop) selectCandidates(
 			"score":       score,
 			"threshold":   agent.Router.Threshold(),
 		})
-	return agent.LightCandidates, resolvedCandidateModel(agent.LightCandidates, agent.Router.LightModel())
+	return agent.LightCandidates, resolvedCandidateModel(agent.LightCandidates, agent.Router.LightModel()), true
 }
 
 // maybeSummarize triggers summarization if the session history exceeds thresholds.
@@ -3159,6 +3288,97 @@ func (al *AgentLoop) handleCommand(
 	}
 }
 
+func activeSkillNames(agent *AgentInstance, opts processOptions) []string {
+	if agent == nil {
+		return nil
+	}
+
+	combined := make([]string, 0, len(agent.SkillsFilter)+len(opts.ForcedSkills))
+	combined = append(combined, agent.SkillsFilter...)
+	combined = append(combined, opts.ForcedSkills...)
+	if len(combined) == 0 {
+		return nil
+	}
+
+	var resolved []string
+	seen := make(map[string]struct{}, len(combined))
+	for _, name := range combined {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if agent.ContextBuilder != nil {
+			if canonical, ok := agent.ContextBuilder.ResolveSkillName(name); ok {
+				name = canonical
+			}
+		}
+		key := strings.ToLower(name)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		resolved = append(resolved, name)
+	}
+
+	return resolved
+}
+
+func (al *AgentLoop) applyExplicitSkillCommand(
+	raw string,
+	agent *AgentInstance,
+	opts *processOptions,
+) (matched bool, handled bool, reply string) {
+	cmdName, ok := commands.CommandName(raw)
+	if !ok || cmdName != "use" {
+		return false, false, ""
+	}
+
+	if agent == nil || agent.ContextBuilder == nil {
+		return true, true, commandsUnavailableSkillMessage()
+	}
+
+	parts := strings.Fields(strings.TrimSpace(raw))
+	if len(parts) < 2 {
+		return true, true, buildUseCommandHelp(agent)
+	}
+
+	arg := strings.TrimSpace(parts[1])
+	if strings.EqualFold(arg, "clear") || strings.EqualFold(arg, "off") {
+		if opts != nil {
+			al.clearPendingSkills(opts.SessionKey)
+		}
+		return true, true, "Cleared pending skill override."
+	}
+
+	skillName, ok := agent.ContextBuilder.ResolveSkillName(arg)
+	if !ok {
+		return true, true, fmt.Sprintf("Unknown skill: %s\nUse /list skills to see installed skills.", arg)
+	}
+
+	if len(parts) < 3 {
+		if opts == nil || strings.TrimSpace(opts.SessionKey) == "" {
+			return true, true, commandsUnavailableSkillMessage()
+		}
+		al.setPendingSkills(opts.SessionKey, []string{skillName})
+		return true, true, fmt.Sprintf(
+			"Skill %q is armed for your next message. Send your next prompt normally, or use /use clear to cancel.",
+			skillName,
+		)
+	}
+
+	message := strings.TrimSpace(strings.Join(parts[2:], " "))
+	if message == "" {
+		return true, true, buildUseCommandHelp(agent)
+	}
+
+	if opts != nil {
+		opts.ForcedSkills = append(opts.ForcedSkills, skillName)
+		opts.UserMessage = message
+	}
+
+	return true, false, ""
+}
+
 func (al *AgentLoop) buildCommandsRuntime(agent *AgentInstance, opts *processOptions) *commands.Runtime {
 	registry := al.GetRegistry()
 	cfg := al.GetConfig()
@@ -3199,6 +3419,9 @@ func (al *AgentLoop) buildCommandsRuntime(agent *AgentInstance, opts *processOpt
 		return al.reloadFunc()
 	}
 	if agent != nil {
+		if agent.ContextBuilder != nil {
+			rt.ListSkillNames = agent.ContextBuilder.ListSkillNames
+		}
 		rt.GetModelInfo = func() (string, string) {
 			return agent.Model, resolvedCandidateProvider(agent.Candidates, cfg.Agents.Defaults.Provider)
 		}
@@ -3249,79 +3472,6 @@ func (al *AgentLoop) buildCommandsRuntime(agent *AgentInstance, opts *processOpt
 		}
 	}
 	return rt
-}
-
-func activeSkillNames(agent *AgentInstance, opts processOptions) []string {
-	var out []string
-	seen := make(map[string]struct{})
-
-	appendNames := func(names []string) {
-		for _, name := range names {
-			name = strings.TrimSpace(name)
-			if name == "" {
-				continue
-			}
-			if _, exists := seen[name]; exists {
-				continue
-			}
-			seen[name] = struct{}{}
-			out = append(out, name)
-		}
-	}
-
-	if agent != nil {
-		appendNames(agent.SkillsFilter)
-	}
-	appendNames(opts.ForcedSkills)
-
-	return out
-}
-
-func (al *AgentLoop) applyExplicitSkillCommand(
-	raw string,
-	agent *AgentInstance,
-	opts *processOptions,
-) (matched bool, handled bool, reply string) {
-	commandName, ok := commands.CommandName(raw)
-	if !ok || commandName != "use" {
-		return false, false, ""
-	}
-
-	if agent == nil || agent.ContextBuilder == nil {
-		return true, true, commandsUnavailableSkillMessage()
-	}
-
-	fields := strings.Fields(strings.TrimSpace(raw))
-	if len(fields) < 2 {
-		return true, true, buildUseCommandHelp(agent)
-	}
-
-	if strings.EqualFold(fields[1], "clear") || strings.EqualFold(fields[1], "off") {
-		al.clearPendingSkills(opts.SessionKey)
-		return true, true, "Cleared pending skill override."
-	}
-
-	canonicalSkill, ok := agent.ContextBuilder.ResolveSkillName(fields[1])
-	if !ok {
-		return true, true, fmt.Sprintf("Unknown skill: %s\nUse /list skills to see installed skills.", fields[1])
-	}
-
-	if len(fields) == 2 {
-		al.setPendingSkills(opts.SessionKey, []string{canonicalSkill})
-		return true, true, fmt.Sprintf(
-			"Skill %q is armed for your next message.\nSend your next request normally, or use /use clear to cancel.",
-			canonicalSkill,
-		)
-	}
-
-	message := strings.TrimSpace(strings.Join(fields[2:], " "))
-	if message == "" {
-		return true, true, buildUseCommandHelp(agent)
-	}
-
-	opts.UserMessage = message
-	opts.ForcedSkills = append(opts.ForcedSkills, canonicalSkill)
-	return true, false, ""
 }
 
 func commandsUnavailableSkillMessage() string {
